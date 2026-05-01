@@ -634,3 +634,81 @@ def analyze_sequence(
 
 
 # ============================================================================
+# Color Mode Normalization
+# ============================================================================
+
+def normalize_frame_mode(
+    im: Image.Image,
+    target_mode: str = "RGB",
+    background_color: Tuple[int, int, int] = (0, 0, 0),
+) -> Image.Image:
+    """
+    Normalizes an image of arbitrary mode (CMYK, RGBA, L, P, 1, LA, YCbCr, I, F, etc.)
+    into standard RGB or RGBA.
+    """
+    target = target_mode.upper()
+    if target not in ("RGB", "RGBA"):
+        raise ValueError(f"Unsupported target mode '{target_mode}'. Expected 'RGB' or 'RGBA'.")
+
+    if target == "RGBA":
+        if im.mode == "RGBA":
+            return im.copy()
+        elif im.mode == "RGB":
+            return im.convert("RGBA")
+        elif im.mode in ("LA", "PA"):
+            return im.convert("RGBA")
+        elif im.mode == "CMYK":
+            return im.convert("RGB").convert("RGBA")
+        elif im.mode in ("L", "1", "P"):
+            return im.convert("RGBA")
+        elif "16" in im.mode or im.mode in ("I", "F"):
+            im_l = im.point(lambda i: i * (1 / 256)).convert("L") if "16" in im.mode else im.convert("L")
+            return im_l.convert("RGBA")
+        else:
+            return im.convert("RGBA")
+    else:  # target == "RGB"
+        if im.mode == "RGB":
+            return im.copy()
+        elif im.mode == "RGBA":
+            # Composite over background_color matte
+            bg = Image.new("RGB", im.size, background_color)
+            alpha = im.split()[3]
+            bg.paste(im.convert("RGB"), mask=alpha)
+            return bg
+        elif im.mode == "LA":
+            im_rgba = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, background_color)
+            alpha = im_rgba.split()[3]
+            bg.paste(im_rgba.convert("RGB"), mask=alpha)
+            return bg
+        elif im.mode == "CMYK":
+            return im.convert("RGB")
+        elif im.mode in ("L", "1", "P"):
+            return im.convert("RGB")
+        elif "16" in im.mode or im.mode in ("I", "F"):
+            im_l = im.point(lambda i: i * (1 / 256)).convert("L") if "16" in im.mode else im.convert("L")
+            return im_l.convert("RGB")
+        else:
+            return im.convert("RGB")
+
+
+# Alias for compatibility
+normalize_image_mode = normalize_frame_mode
+
+
+def load_and_normalize_frame(
+    path: Union[Path, str],
+    target_mode: str = "RGBA",
+    background_color: Tuple[int, int, int] = (0, 0, 0),
+) -> Image.Image:
+    """
+    Opens an image file and normalizes its color mode to target_mode.
+    """
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        raise CorruptImageError(p, "Image file does not exist or is empty.")
+    try:
+        with Image.open(p) as img:
+            return normalize_frame_mode(img, target_mode=target_mode, background_color=background_color)
+    except Exception as exc:
+        raise CorruptImageError(p, f"Failed to load and normalize image: {exc}") from exc
