@@ -446,3 +446,97 @@ def discover_sequence_folders(
 
 
 # ============================================================================
+# Camera & Pass Auto-Grouping Heuristics
+# ============================================================================
+
+CAMERA_PATTERNS = [
+    re.compile(r'(?i)(?:^|[-_.\s])(?P<cam>(?:camera|cam|view|angle)[-_\s]*[0-9a-zA-Z]+)(?:[-_.\s]|$)', re.IGNORECASE),
+    re.compile(r'(?i)(?:^|[-_.\s])(?P<cam>front|back|left|right|top|bottom|persp(?:ective)?|iso(?:metric)?|ortho(?:graphic)?|turntable)(?:[-_.\s]|$)', re.IGNORECASE),
+]
+
+PASS_PATTERNS = [
+    re.compile(r'(?i)(?:^|[-_.\s])(?:pass[-_.\s]*)?(?P<pass>beauty|diffuse|albedo|base_?color|normal[s]?|roughness|rough|metallic|metalness|metal|specular|spec|ao|ambient[-_]?occlusion|clay(?:[-_]?render)?|wireframe|wire|depth|z[-_]?depth|shadow[s]?|lighting|direct[-_]?light|indirect|emission|emissive|sss|subsurface|mask|id|cryptomatte|alpha)(?:[-_.\s]|$)', re.IGNORECASE),
+]
+
+
+def extract_group_tag(filename: str) -> Tuple[str, Optional[str]]:
+    """
+    Extracts a unique sequence group identifier and a human-readable camera/pass tag
+    from a filename using heuristic regex patterns.
+    
+    Returns:
+        (group_id, camera_name)
+    """
+    stem = Path(filename).stem
+
+    # 1. Camera tag match
+    for pat in CAMERA_PATTERNS:
+        match = pat.search(stem)
+        if match:
+            raw_cam = match.group("cam")
+            return raw_cam, raw_cam
+
+    # 2. Render pass match
+    for pat in PASS_PATTERNS:
+        match = pat.search(stem)
+        if match:
+            raw_pass = match.group("pass")
+            return raw_pass, raw_pass
+
+    # 3. Strip trailing index numbers
+    prefix = re.sub(r'[-_.\s]*\d+$', '', stem).strip('-_ .')
+    if prefix:
+        return prefix, None
+
+    return "default", None
+
+
+def group_sequences(
+    paths: Sequence[Union[str, Path]],
+    skip_corrupted: bool = True,
+) -> Dict[str, SequenceGroup]:
+    """
+    Clusters a list of image paths into partitioned sequence groups
+    (by camera, render pass, or stage prefix) and analyzes each group.
+    """
+    if not paths:
+        return {}
+
+    path_objs = [Path(p) if not isinstance(p, Path) else p for p in paths]
+    buckets: Dict[str, Tuple[Optional[str], List[Path]]] = {}
+
+    for p in path_objs:
+        group_tag, camera_name = extract_group_tag(p.name)
+        if group_tag not in buckets:
+            buckets[group_tag] = (camera_name, [])
+        buckets[group_tag][1].append(p)
+
+    generic_prefixes = {
+        "frame", "render", "img", "image", "shot", "take", "stage", "seq", "pass", "file", "step", "anim", "default"
+    }
+
+    # If exactly 1 group exists and has a generic prefix without explicit camera
+    if len(buckets) == 1:
+        only_tag = next(iter(buckets.keys()))
+        cam_name, b_paths = buckets[only_tag]
+        if cam_name is None or only_tag.lower() in generic_prefixes:
+            buckets = {"default": (None, b_paths)}
+
+    result: Dict[str, SequenceGroup] = {}
+    for group_id, (cam_name, b_paths) in buckets.items():
+        sorted_paths = natural_sort_paths(b_paths)
+        try:
+            group = analyze_sequence(
+                sorted_paths,
+                group_id=group_id,
+                camera_name=cam_name,
+                skip_corrupted=skip_corrupted,
+            )
+            result[group_id] = group
+        except EmptySequenceError:
+            continue
+
+    return result
+
+
+# ============================================================================
