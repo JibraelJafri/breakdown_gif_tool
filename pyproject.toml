@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=65.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "animforge"
+version = "0.1.0"
+description = "Modern 3D render breakdown image sequence to animated GIF and WebP converter"
+readme = "README.md"
+authors = [
+    { name = "Jibrael Jafri", email = "jibraeljafri@proton.me" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "Pillow>=10.0.0",
+    "rich>=13.0.0",
+    "textual>=0.40.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+]
