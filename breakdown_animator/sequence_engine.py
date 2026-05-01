@@ -540,3 +540,97 @@ def group_sequences(
 
 
 # ============================================================================
+# Sequence Metadata Analysis
+# ============================================================================
+
+def inspect_frame(path: Union[str, Path], index: int = 0) -> FrameInfo:
+    """
+    Reads image header metadata (width, height, mode, file size) without loading
+    the full pixel raster into memory.
+    
+    Raises:
+        CorruptImageError: If the image cannot be opened or is corrupted.
+    """
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        raise CorruptImageError(p, "Image file does not exist or is empty.")
+    try:
+        with Image.open(p) as img:
+            width, height = img.size
+            mode = img.mode
+        file_size = p.stat().st_size
+        return FrameInfo(
+            path=p,
+            index=index,
+            filename=p.name,
+            width=width,
+            height=height,
+            mode=mode,
+            file_size_bytes=file_size,
+        )
+    except Exception as exc:
+        if isinstance(exc, CorruptImageError):
+            raise
+        raise CorruptImageError(p, f"Cannot inspect image header: {exc}") from exc
+
+
+def analyze_sequence(
+    paths: Sequence[Union[str, Path]],
+    group_id: str = "default",
+    camera_name: Optional[str] = None,
+    skip_corrupted: bool = True,
+) -> SequenceGroup:
+    """
+    Analyzes an ordered list of image paths and constructs a SequenceGroup
+    with resolution, dimension mismatch status, and memory estimates.
+    
+    Raises:
+        EmptySequenceError: If paths is empty or contains zero valid readable frames.
+        CorruptImageError: If skip_corrupted is False and a frame is corrupted.
+    """
+    if not paths:
+        raise EmptySequenceError("Cannot analyze an empty sequence of frames.")
+
+    path_objs = [Path(p) if not isinstance(p, Path) else p for p in paths]
+    frames: List[FrameInfo] = []
+
+    for p in path_objs:
+        try:
+            frame_info = inspect_frame(p, index=len(frames))
+            frames.append(frame_info)
+        except Exception as exc:
+            if not skip_corrupted:
+                if isinstance(exc, CorruptImageError):
+                    raise
+                raise CorruptImageError(p, f"Corrupted or unreadable image: {exc}") from exc
+            continue
+
+    if not frames:
+        raise EmptySequenceError(f"No valid readable image frames found in sequence '{group_id}'.")
+
+    widths = [f.width for f in frames]
+    heights = [f.height for f in frames]
+    has_mismatched = (len(set(widths)) > 1) or (len(set(heights)) > 1)
+
+    if has_mismatched:
+        common_w = max(widths)
+        common_h = max(heights)
+    else:
+        common_w = widths[0]
+        common_h = heights[0]
+
+    estimated_memory = sum(f.width * f.height * 4 for f in frames)
+
+    return SequenceGroup(
+        group_id=group_id,
+        camera_name=camera_name,
+        frames=frames,
+        total_frames=len(frames),
+        common_width=common_w,
+        common_height=common_h,
+        has_mismatched_dimensions=has_mismatched,
+        estimated_memory_bytes=estimated_memory,
+    )
+
+
+# ============================================================================
