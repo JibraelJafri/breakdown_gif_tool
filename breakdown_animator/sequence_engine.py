@@ -218,6 +218,42 @@ class SequenceGroup:
 
 
 # ============================================================================
+# Natural Alphanumeric Sorting
+# ============================================================================
+
+def _tokenize_part(part: str) -> tuple:
+    """
+    Decomposes a single path segment or filename string into uniform 4-tuples:
+    - Digits: (1, int(c), len(c), c)
+    - Non-digits: (0, 0, 0, c.casefold())
+    """
+    tokens = []
+    for c in re.split(r'(\d+)', part):
+        if not c:
+            continue
+        if c.isdigit():
+            tokens.append((1, int(c), len(c), c))
+        else:
+            tokens.append((0, 0, 0, c.casefold()))
+    return tuple(tokens)
+
+
+def natural_sort_key(item: Union[str, Path]) -> tuple:
+    """
+    Generates a natural alphanumeric sort key for deterministic ordering
+    (e.g., Step_1 < Step_2 < Step_9 < Step_10).
+    """
+    p = Path(item) if not isinstance(item, Path) else item
+    return tuple(_tokenize_part(part) for part in p.parts)
+
+
+def natural_sort_paths(paths: Sequence[Union[str, Path]]) -> List[Path]:
+    """
+    Sorts a sequence of paths using natural alphanumeric sorting.
+    """
+    path_objs = [Path(p) if not isinstance(p, Path) else p for p in paths]
+    return sorted(path_objs, key=natural_sort_key)
+
 
 # ============================================================================
 # Image Format & System Junk Filtering
