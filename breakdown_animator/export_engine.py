@@ -323,3 +323,83 @@ def harmonize_frame(
 
 
 # ============================================================================
+# Quantization & Palette Engineering
+# ============================================================================
+
+def _get_pillow_quantize_constant(method: QuantizeMethod) -> int:
+    """Maps QuantizeMethod enum to Pillow Image.Quantize integer constant with fallback."""
+    if method == QuantizeMethod.FAST_OCTREE:
+        return Image.Quantize.FASTOCTREE
+    elif method == QuantizeMethod.MAX_COVERAGE:
+        return Image.Quantize.MAXCOVERAGE
+    elif method == QuantizeMethod.LIBIMAGEQUANT:
+        if hasattr(Image.Quantize, "LIBIMAGEQUANT") and features.check_feature("libimagequant"):
+            return Image.Quantize.LIBIMAGEQUANT
+        return Image.Quantize.MEDIANCUT
+    return Image.Quantize.MEDIANCUT
+
+
+def generate_global_sequence_palette(
+    frame_paths: Sequence[Union[Path, str]],
+    color_count: int = 256,
+    method: QuantizeMethod = QuantizeMethod.MEDIAN_CUT,
+    num_samples: int = 5,
+    target_size: Optional[Tuple[int, int]] = None,
+    harmonize_mode: HarmonizeMode = HarmonizeMode.LETTERBOX,
+    background_color: Tuple[int, int, int] = (0, 0, 0),
+) -> Image.Image:
+    """
+    Generates a single global representative palette for the entire image sequence
+    by compositing uniformly sampled sub-frames, preventing palette flickering across frames.
+    """
+    n = len(frame_paths)
+    if n == 0:
+        raise EmptySequenceError("Cannot generate palette from empty frame list.")
+
+    sample_count = min(n, max(1, num_samples))
+    indices = [int(round(i * (n - 1) / (sample_count - 1))) if sample_count > 1 else 0 for i in range(sample_count)]
+    unique_indices = sorted(set(indices))
+
+    sample_images: List[Image.Image] = []
+    for idx in unique_indices:
+        try:
+            im = load_and_normalize_frame(frame_paths[idx], target_mode="RGB", background_color=background_color)
+            if target_size:
+                im = harmonize_frame(im, target_size=target_size, mode=harmonize_mode, bg_color=background_color)
+            # Downsample for fast representative palette generation
+            w, h = im.size
+            if w > 320 or h > 240:
+                scale = min(320 / w, 240 / h)
+                im = im.resize((max(1, round(w * scale)), max(1, round(h * scale))), resample=Image.Resampling.BOX)
+            sample_images.append(im)
+        except Exception:
+            continue
+
+    quant_const = _get_pillow_quantize_constant(method)
+
+    if not sample_images:
+        fallback = Image.new("RGB", (16, 16), background_color)
+        try:
+            return fallback.quantize(colors=color_count, method=quant_const)
+        except Exception:
+            return fallback.quantize(colors=color_count, method=Image.Quantize.MEDIANCUT)
+
+    total_w = sum(img.width for img in sample_images)
+    max_h = max(img.height for img in sample_images)
+    composite = Image.new("RGB", (total_w, max_h), background_color)
+
+    cur_x = 0
+    for img in sample_images:
+        composite.paste(img, (cur_x, 0))
+        cur_x += img.width
+        img.close()
+
+    try:
+        palette_im = composite.quantize(colors=min(256, max(2, color_count)), method=quant_const)
+    except Exception:
+        palette_im = composite.quantize(colors=min(256, max(2, color_count)), method=Image.Quantize.MEDIANCUT)
+    composite.close()
+    return palette_im
+
+
+# ============================================================================
