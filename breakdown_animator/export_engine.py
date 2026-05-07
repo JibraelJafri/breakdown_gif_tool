@@ -203,3 +203,123 @@ def calculate_frame_durations(
 # ============================================================================
 # Dimension Harmonization & Scaling
 # ============================================================================
+
+def resolve_target_dimensions(
+    original_size: Tuple[int, int],
+    scale: Optional[Union[str, float, int, Tuple[int, int]]] = None,
+    target_size: Optional[Tuple[int, int]] = None,
+) -> Tuple[int, int]:
+    """
+    Resolves the final canvas dimensions from native size and scale options.
+    """
+    if target_size is not None and target_size[0] > 0 and target_size[1] > 0:
+        return (int(target_size[0]), int(target_size[1]))
+
+    orig_w, orig_h = original_size
+    if scale is None or scale == "" or scale == "100%" or scale == "native":
+        return (orig_w, orig_h)
+
+    if isinstance(scale, tuple) and len(scale) == 2:
+        return (int(scale[0]), int(scale[1]))
+
+    if isinstance(scale, (int, float)):
+        f = float(scale)
+        if f > 0:
+            return (max(1, round(orig_w * f)), max(1, round(orig_h * f)))
+        return (orig_w, orig_h)
+
+    s_str = str(scale).strip().lower()
+    if s_str in SCALE_PRESETS:
+        preset_w, preset_h = SCALE_PRESETS[s_str]
+        # Preserve aspect ratio fit within preset bounding box
+        ratio = min(preset_w / orig_w, preset_h / orig_h)
+        return (max(1, round(orig_w * ratio)), max(1, round(orig_h * ratio)))
+
+    if s_str.endswith("%"):
+        try:
+            pct = float(s_str.rstrip("%")) / 100.0
+            return (max(1, round(orig_w * pct)), max(1, round(orig_h * pct)))
+        except ValueError:
+            pass
+
+    if "x" in s_str:
+        parts = s_str.split("x")
+        if len(parts) == 2:
+            try:
+                return (int(parts[0].strip()), int(parts[1].strip()))
+            except ValueError:
+                pass
+
+    return (orig_w, orig_h)
+
+
+def harmonize_frame(
+    im: Image.Image,
+    target_size: Tuple[int, int],
+    mode: Union[HarmonizeMode, str] = HarmonizeMode.LETTERBOX,
+    bg_color: Tuple[int, int, int] = (0, 0, 0),
+    background_color: Optional[Tuple[int, int, int]] = None,
+) -> Image.Image:
+    """
+    Harmonizes an individual image frame to the target dimensions using
+    letterboxing, cropping, stretching, or proportional fitting.
+    
+    Args:
+        im: Source PIL Image.
+        target_size: Desired (width, height) output dimensions.
+        mode: HarmonizeMode (LETTERBOX, FIT, CROP, STRETCH).
+        bg_color: Background matte color tuple (R, G, B).
+        background_color: Optional alias for bg_color.
+        
+    Returns:
+        Harmonized PIL Image matching target_size.
+    """
+    effective_bg = background_color if background_color is not None else bg_color
+    h_mode = HarmonizeMode(mode) if not isinstance(mode, HarmonizeMode) else mode
+
+    tw, th = target_size
+    sw, sh = im.size
+
+    if (sw, sh) == (tw, th):
+        return im.copy()
+
+    if h_mode in (HarmonizeMode.LETTERBOX, HarmonizeMode.FIT):
+        scale = min(tw / sw, th / sh)
+        nw = max(1, round(sw * scale))
+        nh = max(1, round(sh * scale))
+        resized = im.resize((nw, nh), resample=Image.Resampling.LANCZOS)
+
+        canvas_mode = "RGBA" if im.mode == "RGBA" else "RGB"
+        canvas_bg = (effective_bg[0], effective_bg[1], effective_bg[2], 255) if canvas_mode == "RGBA" else effective_bg
+        canvas = Image.new(canvas_mode, (tw, th), canvas_bg)
+
+        paste_x = (tw - nw) // 2
+        paste_y = (th - nh) // 2
+
+        if resized.mode == "RGBA" and canvas_mode == "RGBA":
+            canvas.paste(resized, (paste_x, paste_y), mask=resized.split()[3])
+        elif resized.mode == "RGBA" and canvas_mode == "RGB":
+            bg_tile = Image.new("RGB", (nw, nh), effective_bg)
+            bg_tile.paste(resized.convert("RGB"), mask=resized.split()[3])
+            canvas.paste(bg_tile, (paste_x, paste_y))
+        else:
+            canvas.paste(resized.convert(canvas_mode), (paste_x, paste_y))
+
+        return canvas
+
+    elif h_mode == HarmonizeMode.CROP:
+        scale = max(tw / sw, th / sh)
+        nw = max(tw, round(sw * scale))
+        nh = max(th, round(sh * scale))
+        resized = im.resize((nw, nh), resample=Image.Resampling.LANCZOS)
+        crop_x = (nw - tw) // 2
+        crop_y = (nh - th) // 2
+        return resized.crop((crop_x, crop_y, crop_x + tw, crop_y + th))
+
+    elif h_mode == HarmonizeMode.STRETCH:
+        return im.resize((tw, th), resample=Image.Resampling.LANCZOS)
+
+    return im.copy()
+
+
+# ============================================================================
