@@ -156,3 +156,50 @@ class ExportResult:
 
 
 # ============================================================================
+# Timing Math
+# ============================================================================
+
+def calculate_frame_durations(
+    fps: Optional[float] = 12.0,
+    total_frames: int = 1,
+    hold_last_seconds: float = 0.0,
+    frame_duration: Optional[float] = None,
+) -> List[int]:
+    """
+    Computes an array of integer millisecond display durations for each frame in the sequence,
+    incorporating the final-frame freeze hold delay.
+    
+    Args:
+        fps: Playback rate in frames per second (1.0 to 60.0). Used if frame_duration is None.
+        total_frames: Number of frames in the sequence.
+        hold_last_seconds: Duration to freeze/pause on the final frame in seconds.
+        frame_duration: Direct duration per normal step/frame in seconds (e.g. 1.0 or 1.5).
+                        Overrides fps if provided.
+        
+    Returns:
+        List of integer milliseconds for each frame.
+    """
+    if total_frames <= 0:
+        return []
+
+    if frame_duration is not None and frame_duration > 0:
+        base_ms = max(1, round(float(frame_duration) * 1000.0))
+    elif fps is not None and fps > 0:
+        safe_fps = max(0.1, min(120.0, float(fps)))
+        base_ms = max(1, round(1000.0 / safe_fps))
+    else:
+        base_ms = 1000
+
+    hold_ms = max(0, round(float(hold_last_seconds) * 1000.0))
+
+    if total_frames == 1:
+        return [base_ms + hold_ms]
+
+    durations = [base_ms] * (total_frames - 1)
+    durations.append(base_ms + hold_ms)
+    return durations
+
+
+# ============================================================================
+# Dimension Harmonization & Scaling
+# ============================================================================
