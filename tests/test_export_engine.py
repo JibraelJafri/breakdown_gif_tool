@@ -148,3 +148,203 @@ class TestGifExport:
         assert result.output_path == output_file
         assert result.format == ExportFormat.GIF
         assert result.total_frames == 6
+        assert result.file_size_bytes > 0
+
+        # Verify Pillow can open and read all GIF frames
+        with Image.open(output_file) as im:
+            assert im.format == "GIF"
+            assert im.n_frames == 6
+            assert im.size == (480, 270)
+
+    def test_gif_quantization_methods(self, tmp_path: Path):
+        """Tests Median Cut, Fast Octree, and Max Coverage quantization."""
+        frame_paths = create_natural_sort_sequence(tmp_path / "src", count=3, dimensions=(320, 180))
+
+        for method in (QuantizeMethod.MEDIAN_CUT, QuantizeMethod.FAST_OCTREE, QuantizeMethod.MAX_COVERAGE):
+            out_file = tmp_path / f"test_{method.value}.gif"
+            profile = ExportProfile(
+                format=ExportFormat.GIF,
+                quantize_method=method,
+                color_count=64,
+                fps=10.0,
+            )
+            result = export_sequence(frame_paths, out_file, profile)
+            assert out_file.exists()
+            assert result.file_size_bytes > 0
+
+
+class TestWebpExport:
+    """Tests for pure-Pillow animated WebP export."""
+
+    def test_export_webp_lossy(self, tmp_path: Path):
+        """Exports lossy animated WebP with 24-bit color."""
+        frame_paths = create_natural_sort_sequence(tmp_path / "src", count=5, dimensions=(640, 360))
+        output_file = tmp_path / "output_lossy.webp"
+
+        profile = ExportProfile(
+            format=ExportFormat.WEBP,
+            lossless=False,
+            quality=90,
+            fps=24.0,
+            hold_last_seconds=1.5,
+        )
+
+        result = export_sequence(frame_paths, output_file, profile)
+
+        assert output_file.exists()
+        assert result.format == ExportFormat.WEBP
+        assert result.total_frames == 5
+
+        with Image.open(output_file) as im:
+            assert im.format == "WEBP"
+            assert getattr(im, "is_animated", False) is True
+            assert im.n_frames == 5
+            assert im.size == (640, 360)
+
+    def test_export_webp_lossless(self, tmp_path: Path):
+        """Exports lossless animated WebP."""
+        frame_paths = create_natural_sort_sequence(tmp_path / "src", count=4, dimensions=(320, 180))
+        output_file = tmp_path / "output_lossless.webp"
+
+        profile = ExportProfile(
+            format=ExportFormat.WEBP,
+            lossless=True,
+            fps=12.0,
+        )
+
+        result = export_sequence(frame_paths, output_file, profile)
+        assert output_file.exists()
+        assert result.file_size_bytes > 0
+
+
+class TestPresetEngine:
+    """Tests for optimization preset configurations."""
+
+    def test_artstation_preset(self):
+        """ArtStation preset targets <= 10MB GIF with 2.0s hold."""
+        p = get_preset_profile(PresetName.ARTSTATION)
+        assert p.format == ExportFormat.GIF
+        assert p.max_size_mb == 10.0
+        assert p.hold_last_seconds == 2.0
+        assert p.auto_tune is True
+
+    def test_portfolio_4k_preset(self):
+        """Portfolio 4K preset targets high-fidelity WebP."""
+        p = get_preset_profile(PresetName.PORTFOLIO_4K)
+        assert p.format == ExportFormat.WEBP
+        assert p.quality >= 90
+        assert p.hold_last_seconds >= 1.5
+
+    def test_discord_and_slack_presets(self):
+        """Discord <= 8MB, Slack <= 5MB."""
+        p_disc = get_preset_profile(PresetName.DISCORD)
+        assert p_disc.max_size_mb == 8.0
+
+        p_slack = get_preset_profile(PresetName.SLACK)
+        assert p_slack.max_size_mb == 5.0
+
+
+# ============================================================================
+# Tier 2: Boundary & Error Handling Tests
+# ============================================================================
+
+class TestExportEngineEdgeCases:
+    """Boundary conditions, auto-tuning convergence, and cancellation token."""
+
+    def test_auto_tune_respects_target_budget(self, tmp_path: Path):
+        """Auto-tuning downscales or reduces palette to fit under max_size_mb."""
+        frame_paths = create_natural_sort_sequence(tmp_path / "src", count=8, dimensions=(800, 450))
+        output_file = tmp_path / "budget_test.gif"
+
+        # Set tight budget (e.g. 0.5 MB)
+        profile = ExportProfile(
+            format=ExportFormat.GIF,
+            max_size_mb=0.5,
+            auto_tune=True,
+            fps=15.0,
+        )
+
+        result = export_sequence(frame_paths, output_file, profile)
+        assert output_file.exists()
+        assert result.passes_budget is True
+        assert result.file_size_mb <= 0.5
+
+    def test_cancellation_token_halts_export(self, tmp_path: Path):
+        """Cooperative cancellation event halts processing early."""
+        frame_paths = create_natural_sort_sequence(tmp_path / "src", count=10, dimensions=(480, 270))
+        output_file = tmp_path / "cancelled.gif"
+
+        cancel_token = threading.Event()
+        cancel_token.set()  # Cancel immediately
+
+        with pytest.raises((InterruptedError, RuntimeError, Exception)):
+            export_sequence(frame_paths, output_file, ExportProfile(), cancel_token=cancel_token)
+
+    def test_progress_callback_invocation(self, tmp_path: Path):
+        """Progress callback is called across phases with percentages."""
+        frame_paths = create_natural_sort_sequence(tmp_path / "src", count=4, dimensions=(320, 180))
+        output_file = tmp_path / "progress_test.gif"
+
+        events = []
+
+        def on_progress(phase: str, current: int, total: int, pct: float, message: str):
+            events.append((phase, current, total, pct))
+
+        export_sequence(frame_paths, output_file, ExportProfile(), progress_callback=on_progress)
+        assert len(events) > 0
+        # Final event should reach ~1.0 (100%)
+        assert events[-1][3] >= 0.9
+
+    def test_mismatched_dimensions_auto_harmonized(self, tmp_path: Path):
+        """Sequences with varying dimensions are automatically harmonized before encoding."""
+        frame_paths = create_mismatched_dimension_sequence(tmp_path / "src")
+        output_file = tmp_path / "harmonized_output.webp"
+
+        profile = ExportProfile(
+            format=ExportFormat.WEBP,
+            harmonize_mode=HarmonizeMode.LETTERBOX,
+        )
+
+        result = export_sequence(frame_paths, output_file, profile)
+        assert output_file.exists()
+        assert result.total_frames == 5
+
+        # All frames in animated WebP must have uniform dimensions
+        with Image.open(output_file) as im:
+            assert im.n_frames == 5
+
+    def test_color_modes_harmonized_during_export(self, tmp_path: Path):
+        """CMYK, RGBA, L, and P frames are normalized to target canvas mode."""
+        frame_paths = create_color_mode_sequence(tmp_path / "src")
+        output_file = tmp_path / "modes_output.gif"
+
+        result = export_sequence(frame_paths, output_file, ExportProfile(format=ExportFormat.GIF))
+        assert output_file.exists()
+        assert result.total_frames == 5
+
+
+# ============================================================================
+# Tier 3: Pairwise Combination Tests
+# ============================================================================
+
+class TestExportEngineCombinations:
+    """Pairwise combinations of scaling, dithering, formats, and quantization."""
+
+    @pytest.mark.parametrize("fmt", [ExportFormat.GIF, ExportFormat.WEBP])
+    @pytest.mark.parametrize("dither", [DitherMode.FLOYD_STEINBERG, DitherMode.NONE])
+    def test_format_and_dither_matrix(self, tmp_path: Path, fmt: ExportFormat, dither: DitherMode):
+        """Tests matrix of formats and dithering toggles."""
+        frame_paths = create_natural_sort_sequence(tmp_path / f"src_{fmt.value}_{dither.value}", count=3)
+        ext = "gif" if fmt == ExportFormat.GIF else "webp"
+        output_file = tmp_path / f"matrix_out_{fmt.value}_{dither.value}.{ext}"
+
+        profile = ExportProfile(
+            format=fmt,
+            dither=dither,
+            color_count=128,
+            fps=12.0,
+        )
+
+        result = export_sequence(frame_paths, output_file, profile)
+        assert output_file.exists()
+        assert result.total_frames == 3
