@@ -559,3 +559,161 @@ def _export_single_pass(
 
 
 def export_sequence(
+    frames: Sequence[Union[Path, str, Image.Image, FrameInfo]],
+    output_path: Union[Path, str],
+    profile: Optional[ExportProfile] = None,
+    progress_callback: Optional[Callable[[str, int, int, float, str], None]] = None,
+    cancel_token: Optional[threading.Event] = None,
+) -> ExportResult:
+    """
+    Exports a sequence of image frames into an optimized animated GIF or WebP.
+    Includes smart auto-tuning to guarantee adherence to target file-size limits.
+    
+    Args:
+        frames: Ordered sequence of paths, FrameInfo objects, or PIL Images.
+        output_path: Destination file path (.gif or .webp).
+        profile: ExportProfile settings (defaults to ArtStation GIF if None).
+        progress_callback: Progress observer callback (phase, current, total, percentage, message).
+        cancel_token: Cooperative cancellation threading.Event.
+        
+    Returns:
+        ExportResult containing comprehensive export statistics and budget pass/fail status.
+    """
+    if cancel_token and cancel_token.is_set():
+        raise InterruptedError("Export operation cancelled by user token.")
+
+    if not frames:
+        raise EmptySequenceError("Cannot export empty frame sequence.")
+
+    eff_profile = profile if profile is not None else ExportProfile()
+    out_path = Path(output_path)
+
+    # Extract clean paths or temporary files if PIL images were provided
+    frame_paths: List[Path] = []
+    temp_dir: Optional[Path] = None
+
+    for item in frames:
+        if isinstance(item, FrameInfo):
+            frame_paths.append(item.path)
+        elif isinstance(item, (str, Path)):
+            frame_paths.append(Path(item))
+        elif isinstance(item, Image.Image):
+            if temp_dir is None:
+                import tempfile
+                temp_dir = Path(tempfile.mkdtemp(prefix="breakdown_frames_"))
+            temp_path = temp_dir / f"frame_{len(frame_paths):05d}.png"
+            item.save(temp_path, format="PNG")
+            frame_paths.append(temp_path)
+
+    total_frames = len(frame_paths)
+    if total_frames == 0:
+        raise EmptySequenceError("No valid frames available for export.")
+
+    # Calculate animation timing
+    durations = calculate_frame_durations(
+        fps=eff_profile.fps,
+        total_frames=total_frames,
+        hold_last_seconds=eff_profile.hold_last_seconds,
+        frame_duration=eff_profile.frame_duration,
+    )
+    total_duration_ms = sum(durations)
+
+    # Read base dimensions from first valid frame
+    try:
+        with Image.open(frame_paths[0]) as first_im:
+            native_size = first_im.size
+    except Exception as exc:
+        raise CorruptImageError(frame_paths[0], f"Failed reading first frame dimensions: {exc}") from exc
+
+    # Determine initial target resolution
+    target_dims = resolve_target_dimensions(
+        original_size=native_size,
+        scale=eff_profile.scale,
+        target_size=eff_profile.target_size,
+    )
+
+    # Auto-tuning Loop (Predictor-Corrector)
+    current_dims = target_dims
+    current_profile = ExportProfile(
+        format=eff_profile.format,
+        fps=eff_profile.fps,
+        frame_duration=eff_profile.frame_duration,
+        hold_last_seconds=eff_profile.hold_last_seconds,
+        color_count=eff_profile.color_count,
+        quantize_method=eff_profile.quantize_method,
+        dither=eff_profile.dither,
+        lossless=eff_profile.lossless,
+        quality=eff_profile.quality,
+        scale=eff_profile.scale,
+        target_size=eff_profile.target_size,
+        harmonize_mode=eff_profile.harmonize_mode,
+        background_color=eff_profile.background_color,
+        max_size_mb=eff_profile.max_size_mb,
+        auto_tune=eff_profile.auto_tune,
+        loop=eff_profile.loop,
+        sample_global_palette=eff_profile.sample_global_palette,
+        num_palette_samples=eff_profile.num_palette_samples,
+        method=eff_profile.method,
+        minimize_size=eff_profile.minimize_size,
+    )
+
+    max_attempts = 5 if (eff_profile.auto_tune and eff_profile.max_size_mb) else 1
+    attempts = 0
+    file_size_bytes = 0
+    final_dims = current_dims
+    auto_tuned = False
+
+    while attempts < max_attempts:
+        attempts += 1
+        file_size_bytes, final_dims = _export_single_pass(
+            frame_paths=frame_paths,
+            output_path=out_path,
+            profile=current_profile,
+            target_dimensions=current_dims,
+            durations=durations,
+            progress_callback=progress_callback,
+            cancel_token=cancel_token,
+        )
+
+        size_mb = file_size_bytes / (1024.0 * 1024.0)
+
+        # Check if we satisfy target budget or don't need auto-tuning
+        if not current_profile.auto_tune or current_profile.max_size_mb is None or size_mb <= current_profile.max_size_mb:
+            break
+
+        # Need to reduce size: compute predictor scale
+        auto_tuned = True
+        target_budget_bytes = current_profile.max_size_mb * 1024 * 1024 * 0.90
+        overshoot_ratio = target_budget_bytes / max(1, file_size_bytes)
+        linear_scale = min(0.85, max(0.30, math.sqrt(overshoot_ratio)))
+
+        new_w = max(160, round(current_dims[0] * linear_scale))
+        new_h = max(120, round(current_dims[1] * linear_scale))
+        current_dims = (new_w, new_h)
+
+        if current_profile.format == ExportFormat.GIF and current_profile.color_count > 64:
+            current_profile.color_count = max(32, current_profile.color_count // 2)
+        elif current_profile.format == ExportFormat.WEBP:
+            current_profile.quality = max(35, int(current_profile.quality * linear_scale))
+
+    file_size_mb = file_size_bytes / (1024.0 * 1024.0)
+    passes_budget = (eff_profile.max_size_mb is None) or (file_size_mb <= eff_profile.max_size_mb)
+
+    # Clean up temporary frames if created
+    if temp_dir is not None and temp_dir.exists():
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return ExportResult(
+        output_path=out_path,
+        format=eff_profile.format,
+        total_frames=total_frames,
+        file_size_bytes=file_size_bytes,
+        file_size_mb=file_size_mb,
+        passes_budget=passes_budget,
+        duration_ms=total_duration_ms,
+        dimensions=final_dims,
+        auto_tuned=auto_tuned,
+        attempts=attempts,
+        duration_seconds=total_duration_ms / 1000.0,
+    )
