@@ -403,3 +403,159 @@ def generate_global_sequence_palette(
 
 
 # ============================================================================
+# Core Sequence Export & Auto-Tuning Engine
+# ============================================================================
+
+def _export_single_pass(
+    frame_paths: List[Path],
+    output_path: Path,
+    profile: ExportProfile,
+    target_dimensions: Tuple[int, int],
+    durations: List[int],
+    progress_callback: Optional[Callable[[str, int, int, float, str], None]] = None,
+    cancel_token: Optional[threading.Event] = None,
+) -> Tuple[int, Tuple[int, int]]:
+    """
+    Executes a single pass of sequence transformation and file encoding.
+    Returns (file_size_bytes, final_dimensions).
+    """
+    total_frames = len(frame_paths)
+    out_fmt = profile.format
+
+    def report_progress(phase: str, current: int, total: int, pct: float, msg: str):
+        if progress_callback:
+            progress_callback(phase, current, total, pct, msg)
+
+    if cancel_token and cancel_token.is_set():
+        raise InterruptedError("Export operation cancelled by user token.")
+
+    report_progress("Validating", 0, total_frames, 0.05, "Validating sequence frames...")
+
+    dither_mode = profile.get_dither_mode()
+    dither_flag = Image.Dither.FLOYDSTEINBERG if dither_mode == DitherMode.FLOYD_STEINBERG else Image.Dither.NONE
+
+    # 1. Prepare palette for GIF if applicable
+    global_palette_im: Optional[Image.Image] = None
+    if out_fmt == ExportFormat.GIF and profile.sample_global_palette:
+        report_progress("Sampling Palette", 0, total_frames, 0.15, "Sampling global sequence color palette...")
+        try:
+            global_palette_im = generate_global_sequence_palette(
+                frame_paths=frame_paths,
+                color_count=profile.color_count,
+                method=profile.quantize_method,
+                num_samples=profile.num_palette_samples,
+                target_size=target_dimensions,
+                harmonize_mode=profile.harmonize_mode,
+                background_color=profile.background_color,
+            )
+        except Exception:
+            global_palette_im = None
+
+    if cancel_token and cancel_token.is_set():
+        raise InterruptedError("Export operation cancelled by user token.")
+
+    # 2. Process, harmonize, and quantize frames
+    processed_frames: List[Image.Image] = []
+    quant_const = _get_pillow_quantize_constant(profile.quantize_method)
+
+    for i, p in enumerate(frame_paths):
+        if cancel_token and cancel_token.is_set():
+            for f in processed_frames:
+                f.close()
+            if global_palette_im:
+                global_palette_im.close()
+            raise InterruptedError("Export operation cancelled by user token.")
+
+        pct = 0.20 + (0.60 * (i + 1) / total_frames)
+        report_progress(
+            "Processing & Resizing" if out_fmt == ExportFormat.WEBP else "Quantizing",
+            i + 1,
+            total_frames,
+            pct,
+            f"Processing frame {i + 1}/{total_frames}...",
+        )
+
+        target_mode = "RGBA" if (out_fmt == ExportFormat.WEBP and profile.lossless) else "RGB"
+        frame_im = load_and_normalize_frame(p, target_mode=target_mode, background_color=profile.background_color)
+        harmonized = harmonize_frame(
+            frame_im,
+            target_size=target_dimensions,
+            mode=profile.harmonize_mode,
+            bg_color=profile.background_color,
+        )
+        frame_im.close()
+
+        if out_fmt == ExportFormat.GIF:
+            if global_palette_im is not None:
+                quantized = harmonized.quantize(palette=global_palette_im, dither=dither_flag)
+            else:
+                try:
+                    quantized = harmonized.quantize(
+                        colors=profile.color_count,
+                        method=quant_const,
+                        dither=dither_flag,
+                    )
+                except Exception:
+                    quantized = harmonized.quantize(
+                        colors=profile.color_count,
+                        method=Image.Quantize.MEDIANCUT,
+                        dither=dither_flag,
+                    )
+            harmonized.close()
+            processed_frames.append(quantized)
+        else:
+            processed_frames.append(harmonized)
+
+    if not processed_frames:
+        raise EmptySequenceError("No processed frames to export.")
+
+    # 3. Save animation
+    report_progress("Encoding", total_frames, total_frames, 0.90, f"Encoding {out_fmt.value.upper()} animation...")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    first_frame = processed_frames[0]
+    rest_frames = processed_frames[1:]
+
+    try:
+        if out_fmt == ExportFormat.GIF:
+            first_frame.save(
+                output_path,
+                save_all=True,
+                append_images=rest_frames,
+                duration=durations,
+                loop=profile.loop,
+                optimize=True,
+                format="GIF",
+            )
+        else:  # WEBP
+            first_frame.save(
+                output_path,
+                save_all=True,
+                append_images=rest_frames,
+                duration=durations,
+                loop=profile.loop,
+                lossless=profile.lossless,
+                quality=profile.quality,
+                method=profile.method,
+                minimize_size=profile.minimize_size,
+                format="WEBP",
+            )
+    finally:
+        for f in processed_frames:
+            try:
+                f.close()
+            except Exception:
+                pass
+        if global_palette_im:
+            try:
+                global_palette_im.close()
+            except Exception:
+                pass
+        gc.collect()
+
+    file_size = output_path.stat().st_size if output_path.exists() else 0
+    report_progress("Finished", total_frames, total_frames, 1.0, f"Export complete ({file_size / (1024*1024):.2f} MB).")
+    return file_size, target_dimensions
+
+
+def export_sequence(
