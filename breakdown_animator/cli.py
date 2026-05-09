@@ -258,3 +258,174 @@ def run_cli(args: Optional[Sequence[str]] = None) -> int:
                 return 1
             groups = group_sequences(paths)
             if not groups:
+                console.print(f"[bold red]Error:[/bold red] No sequence passes could be parsed from [yellow]{fld}[/yellow]")
+                return 1
+
+            # Filter camera passes
+            target_groups: Dict[str, SequenceGroup] = {}
+            if parsed_args.camera.lower() == "all":
+                target_groups = groups
+            else:
+                cam_target = parsed_args.camera.strip()
+                matched = False
+                for gid, grp in groups.items():
+                    if gid.lower() == cam_target.lower() or (grp.camera_name and grp.camera_name.lower() == cam_target.lower()):
+                        target_groups[gid] = grp
+                        matched = True
+                if not matched:
+                    console.print(f"[bold red]Error:[/bold red] Camera/pass '[yellow]{cam_target}[/yellow]' not found in folder.")
+                    console.print(f"Available passes: {', '.join(groups.keys())}")
+                    return 1
+
+            folder_jobs.append((fld, target_groups))
+        except Exception as exc:
+            console.print(f"[bold red]Error scanning sequence in '{fld}':[/bold red] {exc}")
+            return 1
+
+    # 3. Dry-run inspection
+    if parsed_args.dry_run:
+        console.print(Panel.fit(
+            f"[bold cyan]AnimForge Sequence Dry-Run Inspection[/bold cyan]\n"
+            f"Target Folders: [bold]{len(folder_jobs)}[/bold]",
+            border_style="cyan",
+        ))
+
+        table = Table(title="Discovered Sequence Passes", border_style="blue")
+        table.add_column("Folder", style="dim cyan")
+        table.add_column("Pass / Camera ID", style="bold cyan")
+        table.add_column("Frames", justify="right", style="green")
+        table.add_column("Resolution", justify="center")
+        table.add_column("Aspect", justify="center")
+        table.add_column("Uncompressed RAM", justify="right")
+        table.add_column("Status", justify="center")
+
+        for fld, t_groups in folder_jobs:
+            for gid, grp in t_groups.items():
+                cam_label = grp.camera_name or gid
+                status_tag = "[yellow]Mixed Res[/yellow]" if grp.has_mismatched_dimensions else "[green]Uniform[/green]"
+                table.add_row(
+                    fld.name,
+                    cam_label,
+                    str(grp.total_frames),
+                    f"{grp.common_width}x{grp.common_height}",
+                    grp.aspect_ratio_str,
+                    f"~{grp.estimated_memory_mb:.1f} MB",
+                    status_tag,
+                )
+        console.print(table)
+        console.print("[dim]Dry run complete. No animation files written.[/dim]")
+        return 0
+
+    # 4. Resolve Export Profile
+    base_profile = get_preset_profile(parsed_args.preset)
+
+    if parsed_args.format:
+        base_profile.format = ExportFormat.from_str(parsed_args.format)
+    if parsed_args.frame_duration is not None:
+        base_profile.frame_duration = parsed_args.frame_duration
+        base_profile.fps = max(0.1, 1.0 / parsed_args.frame_duration)
+    elif parsed_args.fps is not None:
+        base_profile.fps = parsed_args.fps
+        base_profile.frame_duration = None
+    if parsed_args.hold_last is not None:
+        base_profile.hold_last_seconds = parsed_args.hold_last
+    if parsed_args.max_size_mb is not None:
+        base_profile.max_size_mb = parsed_args.max_size_mb
+        base_profile.auto_tune = True
+    if parsed_args.scale:
+        base_profile.scale = parsed_args.scale
+    if parsed_args.colors is not None:
+        if base_profile.format == ExportFormat.GIF:
+            base_profile.color_count = parsed_args.colors
+        else:
+            base_profile.quality = parsed_args.colors
+    if parsed_args.dither is not None:
+        base_profile.dither = DitherMode.FLOYD_STEINBERG if parsed_args.dither else DitherMode.NONE
+    if parsed_args.harmonize:
+        base_profile.harmonize_mode = HarmonizeMode(parsed_args.harmonize)
+
+    total_passes = sum(len(t_groups) for _, t_groups in folder_jobs)
+    console.print(Panel.fit(
+        f"[bold cyan]AnimForge Export Pipeline[/bold cyan]\n"
+        f"Folders: [bold]{len(folder_jobs)}[/bold] | Total Sequence Passes: [bold]{total_passes}[/bold] | Preset: [bold]{parsed_args.preset}[/bold] | Format: [bold]{base_profile.format.value.upper()}[/bold]",
+        border_style="cyan",
+    ))
+
+    # 5. Execute Export Batch
+    results: List[ExportResult] = []
+    is_multi_folder = len(folder_jobs) > 1
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        for fld_idx, (fld, t_groups) in enumerate(folder_jobs, start=1):
+            out_dir = Path(parsed_args.output_dir) if parsed_args.output_dir else (fld / "output")
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            for gid, grp in t_groups.items():
+                cam_name = grp.camera_name or gid
+                ext = "gif" if base_profile.format == ExportFormat.GIF else "webp"
+                if is_multi_folder:
+                    out_file = out_dir / f"{fld.name}_{gid}_breakdown.{ext}"
+                    display_name = f"[{fld_idx}/{len(folder_jobs)}] {fld.name}/{cam_name}"
+                else:
+                    out_file = out_dir / f"{gid}_breakdown.{ext}"
+                    display_name = cam_name
+
+                task = progress.add_task(f"Exporting {display_name}...", total=100)
+
+                def make_progress_cb(t_id: TaskID, dname: str):
+                    def cb(phase: str, cur: int, total: int, pct: float, msg: str):
+                        progress.update(t_id, completed=int(pct * 100), description=f"[{phase}] {dname}")
+                    return cb
+
+                try:
+                    res = export_sequence(
+                        frames=grp.frame_paths,
+                        output_path=out_file,
+                        profile=base_profile,
+                        progress_callback=make_progress_cb(task, display_name),
+                    )
+                    results.append(res)
+                    progress.update(task, completed=100, description=f"[green][OK] Done:[/green] {display_name}")
+                except Exception as exc:
+                    progress.update(task, description=f"[red][FAIL] Failed:[/red] {display_name}")
+                    console.print(f"[bold red]Failed exporting pass '{gid}' in '{fld.name}':[/bold red] {exc}")
+                    return 1
+
+    # 6. Summary Table
+    summary_table = Table(title="Export Summary & Compatibility", border_style="green")
+    summary_table.add_column("Output File", style="bold cyan")
+    summary_table.add_column("Frames", justify="right")
+    summary_table.add_column("Resolution", justify="center")
+    summary_table.add_column("Duration", justify="right")
+    summary_table.add_column("File Size", justify="right", style="bold")
+    summary_table.add_column("ArtStation (<=10M)", justify="center")
+    summary_table.add_column("Discord (<=8M)", justify="center")
+    summary_table.add_column("Slack (<=5M)", justify="center")
+
+    for r in results:
+        art_pass = "[bold green]PASS[/bold green]" if r.file_size_mb <= 10.0 else "[bold red]FAIL[/bold red]"
+        disc_pass = "[bold green]PASS[/bold green]" if r.file_size_mb <= 8.0 else "[bold red]FAIL[/bold red]"
+        slack_pass = "[bold green]PASS[/bold green]" if r.file_size_mb <= 5.0 else "[bold red]FAIL[/bold red]"
+
+        summary_table.add_row(
+            r.output_path.name,
+            str(r.total_frames),
+            f"{r.dimensions[0]}x{r.dimensions[1]}",
+            f"{r.duration_seconds:.2f}s",
+            f"{r.file_size_mb:.2f} MB",
+            art_pass,
+            disc_pass,
+            slack_pass,
+        )
+
+    console.print(summary_table)
+    dest_msg = f"output directory: [bold]{Path(parsed_args.output_dir).resolve()}[/bold]" if parsed_args.output_dir else "their respective output folders"
+    console.print(f"[bold green]✨ Successfully exported {len(results)} animation(s) to {dest_msg}.[/bold green]")
+    return 0
