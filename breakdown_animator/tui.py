@@ -198,3 +198,153 @@ Footer {
     width: 22;
 }
 
+#btn_cancel {
+    background: #ef4444;
+    color: #ffffff;
+    width: 14;
+    margin-left: 1;
+}
+
+/* Modal Dialog */
+SummaryModal {
+    align: center middle;
+}
+
+#modal_dialog {
+    width: 65;
+    height: auto;
+    background: #18202f;
+    border: thick #38bdf8;
+    padding: 2;
+}
+
+.badge_pass {
+    color: #10b981;
+    text-style: bold;
+}
+
+.badge_fail {
+    color: #ef4444;
+    text-style: bold;
+}
+"""
+
+
+# ============================================================================
+# Output Summary Modal
+# ============================================================================
+
+class SummaryModal(ModalScreen):
+    """Modal dialog presenting export completion metrics and platform size limit badges."""
+
+    def __init__(self, result: ExportResult, output_dir: Path):
+        super().__init__()
+        self.result = result
+        self.output_dir = output_dir
+
+    def compose(self) -> ComposeResult:
+        res = self.result
+        size_mb = res.file_size_mb
+
+        artstation_badge = "[PASS] <= 10.0 MB" if size_mb <= 10.0 else "[FAIL] > 10.0 MB"
+        discord_badge = "[PASS] <= 8.0 MB" if size_mb <= 8.0 else "[FAIL] > 8.0 MB"
+        slack_badge = "[PASS] <= 5.0 MB" if size_mb <= 5.0 else "[FAIL] > 5.0 MB"
+
+        art_class = "badge_pass" if size_mb <= 10.0 else "badge_fail"
+        disc_class = "badge_pass" if size_mb <= 8.0 else "badge_fail"
+        slack_class = "badge_pass" if size_mb <= 5.0 else "badge_fail"
+
+        yield Vertical(
+            Label("🎉 Animation Export Complete", classes="panel_title"),
+            Static(f"• File: [bold cyan]{res.output_path.name}[/bold cyan]"),
+            Static(f"• Format: [bold]{res.format.value.upper()}[/bold]"),
+            Static(f"• Frames: [bold]{res.total_frames}[/bold] | Resolution: [bold]{res.dimensions[0]}x{res.dimensions[1]}[/bold]"),
+            Static(f"• Duration: [bold]{res.duration_seconds:.2f}s[/bold] | Size: [bold]{size_mb:.2f} MB[/bold]"),
+            Static(f"• Auto-Tuned: [bold]{'Yes (' + str(res.attempts) + ' passes)' if res.auto_tuned else 'No'}[/bold]"),
+            Static(""),
+            Label("Platform Size Compatibility:"),
+            Static(f"  ArtStation (<=10 MB): [{art_class}]{artstation_badge}[/{art_class}]"),
+            Static(f"  Discord (<=8 MB):    [{disc_class}]{discord_badge}[/{disc_class}]"),
+            Static(f"  Slack (<=5 MB):      [{slack_class}]{slack_badge}[/{slack_class}]"),
+            Static(""),
+            Horizontal(
+                Button("Open Output Folder", id="btn_open_folder", variant="primary"),
+                Button("Close", id="btn_close_modal", variant="default"),
+                classes="control_row",
+            ),
+            id="modal_dialog",
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn_close_modal":
+            self.dismiss()
+        elif event.button.id == "btn_open_folder":
+            self._open_folder(self.output_dir)
+
+    def _open_folder(self, folder: Path) -> None:
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(folder))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception:
+            pass
+
+
+# ============================================================================
+# Main Textual Application
+# ============================================================================
+
+class AnimForgeApp(App):
+    """Breakdown Animator (animforge) Interactive Terminal User Interface."""
+
+    TITLE = "AnimForge — 3D Breakdown Animator"
+    SUB_TITLE = "Pure-Pillow GIF & WebP Sequence Engine"
+    CSS = TUI_CSS
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit", priority=True),
+        Binding("r", "refresh_sequence", "Refresh / Scan"),
+        Binding("e", "trigger_export", "Export Animation"),
+        Binding("d", "toggle_dark", "Toggle Theme"),
+    ]
+
+    current_groups: reactive[Dict[str, SequenceGroup]] = reactive({})
+    active_group_id: reactive[str] = reactive("")
+    is_exporting: reactive[bool] = reactive(False)
+
+    def __init__(self, initial_path: Optional[str] = None):
+        super().__init__()
+        self.initial_path = initial_path or ""
+        self.cancel_token: Optional[threading.Event] = None
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+
+        # Top Directory Input Bar
+        yield Horizontal(
+            Input(
+                value=self.initial_path,
+                placeholder="Enter or paste path to breakdown renders folder...",
+                id="dir_input",
+            ),
+            Button("Scan Folder", id="btn_scan"),
+            id="top_bar",
+        )
+
+        # Main 2-Column Working Layout
+        yield Horizontal(
+            # Left: Sequence Inspector & Group Browser
+            Vertical(
+                Label("📁 Sequence Inspector", classes="panel_title"),
+                DataTable(id="sequence_table"),
+                Static("No sequence loaded.", id="sequence_details"),
+                id="left_column",
+            ),
+            # Right: Preset & Encoding Controls
+            Vertical(
+                Label("⚙️ Preset & Export Controls", classes="panel_title"),
+                ScrollableContainer(
+                    Horizontal(
