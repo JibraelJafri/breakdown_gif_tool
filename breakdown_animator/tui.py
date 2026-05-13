@@ -548,3 +548,173 @@ class AnimForgeApp(App):
         try:
             status.update(f"Scanning [cyan]{p.name}[/cyan]...")
             paths = scan_directory(p)
+            if not paths:
+                sub_dirs = discover_sequence_folders(p, max_depth=2, include_root_if_has_images=False)
+                if sub_dirs:
+                    p = sub_dirs[0]
+                    paths = scan_directory(p)
+                    status.update(f"[cyan]Found {len(sub_dirs)} subfolders. Loaded: {p.name}[/cyan]")
+                else:
+                    status.update("[yellow]No supported image frames found in folder.[/yellow]")
+                    details.update("Folder contains zero valid images.")
+                    table.clear()
+                    self.current_groups = {}
+                    self.active_group_id = ""
+                    return
+
+            groups = group_sequences(paths)
+            self.current_groups = groups
+            table.clear()
+
+            first_group: Optional[SequenceGroup] = None
+            for gid, group in groups.items():
+                if first_group is None:
+                    first_group = group
+                label_name = group.camera_name or gid
+                table.add_row(
+                    label_name,
+                    str(group.total_frames),
+                    f"{group.common_width}x{group.common_height}",
+                    group.aspect_ratio_str,
+                    key=gid,
+                )
+
+            if first_group:
+                self.active_group_id = first_group.group_id
+                self._update_details_view(first_group)
+
+            status.update(f"[green]Discovered {len(paths)} frames across {len(groups)} sequence pass(es).[/green]")
+
+        except Exception as exc:
+            status.update(f"[red]Scan failed:[/red] {exc}")
+            details.update(f"[red]Error analyzing folder: {exc}[/red]")
+            table.clear()
+            self.current_groups = {}
+            self.active_group_id = ""
+
+    def _update_details_view(self, group: SequenceGroup) -> None:
+        details = self.query_one("#sequence_details", Static)
+        tag = group.camera_name or group.group_id
+        mismatch_warn = " [yellow](Mixed Res - Will Harmonize)[/yellow]" if group.has_mismatched_dimensions else ""
+
+        text = (
+            f"[bold cyan]Sequence Pass:[/bold cyan] {tag}\n"
+            f"[bold]• Frame Count:[/bold] {group.total_frames} frames\n"
+            f"[bold]• Resolution:[/bold] {group.common_width}x{group.common_height}{mismatch_warn}\n"
+            f"[bold]• Aspect Ratio:[/bold] {group.aspect_ratio_str} ({group.aspect_ratio:.2f})\n"
+            f"[bold]• Uncompressed RAM:[/bold] ~{group.estimated_memory_mb:.1f} MB\n"
+            f"[bold]• First Frame:[/bold] {group.frames[0].filename if group.frames else 'N/A'}"
+        )
+        details.update(text)
+
+    # ------------------------------------------------------------------------
+    # Export Execution Worker (Background Thread)
+    # ------------------------------------------------------------------------
+
+    def start_export(self) -> None:
+        if self.is_exporting:
+            return
+
+        if not self.current_groups or not self.active_group_id:
+            self.query_one("#status_message", Static).update("[yellow]Please load a valid sequence first.[/yellow]")
+            return
+
+        group = self.current_groups[self.active_group_id]
+        input_dir = Path(clean_folder_path(self.query_one("#dir_input", Input).value.strip()))
+        out_dir = input_dir / "output"
+
+        # Build export profile from inputs
+        fmt_str = self.query_one("#format_select", Select).value
+        out_fmt = ExportFormat.from_str(fmt_str)
+        ext = "gif" if out_fmt == ExportFormat.GIF else "webp"
+
+        out_name = f"{group.group_id}_breakdown.{ext}"
+        out_path = out_dir / out_name
+
+        try:
+            fps = float(self.query_one("#fps_input", Input).value.strip())
+        except ValueError:
+            fps = 1.0
+
+        frame_duration = (1.0 / fps) if fps <= 3.0 else None
+
+        try:
+            hold = float(self.query_one("#hold_input", Input).value.strip())
+        except ValueError:
+            hold = 2.0
+
+        budget_str = self.query_one("#budget_input", Input).value.strip()
+        try:
+            max_size_mb = float(budget_str) if budget_str else None
+        except ValueError:
+            max_size_mb = None
+
+        colors_val = self.query_one("#colors_input", Input).value.strip()
+        try:
+            parsed_colors = int(colors_val)
+        except ValueError:
+            parsed_colors = 256
+
+        scale_val = self.query_one("#scale_select", Select).value
+        dither_val = self.query_one("#dither_checkbox", Checkbox).value
+        harmonize_val = HarmonizeMode(self.query_one("#harmonize_select", Select).value)
+
+        profile = ExportProfile(
+            format=out_fmt,
+            fps=fps,
+            frame_duration=frame_duration,
+            hold_last_seconds=hold,
+            color_count=parsed_colors if out_fmt == ExportFormat.GIF else 256,
+            quality=parsed_colors if out_fmt == ExportFormat.WEBP else 85,
+            dither=DitherMode.FLOYD_STEINBERG if dither_val else DitherMode.NONE,
+            scale=scale_val,
+            max_size_mb=max_size_mb,
+            auto_tune=bool(max_size_mb is not None),
+            harmonize_mode=harmonize_val,
+        )
+
+        self.cancel_token = threading.Event()
+        self.is_exporting = True
+        self.run_export_worker(group.frame_paths, out_path, profile, out_dir)
+
+    @work(exclusive=True, thread=True)
+    def run_export_worker(
+        self,
+        frame_paths: List[Path],
+        out_path: Path,
+        profile: ExportProfile,
+        out_dir: Path,
+    ) -> None:
+        pbar = self.query_one("#progress_bar", ProgressBar)
+        status = self.query_one("#status_message", Static)
+
+        def on_progress(phase: str, cur: int, total: int, pct: float, msg: str):
+            self.call_from_thread(pbar.update, progress=pct * 100)
+            self.call_from_thread(status.update, f"[{phase}] {msg}")
+
+        try:
+            result = export_sequence(
+                frames=frame_paths,
+                output_path=out_path,
+                profile=profile,
+                progress_callback=on_progress,
+                cancel_token=self.cancel_token,
+            )
+            self.call_from_thread(self._on_export_success, result, out_dir)
+        except InterruptedError:
+            self.call_from_thread(status.update, "[yellow]Export cancelled by user.[/yellow]")
+            self.call_from_thread(pbar.update, progress=0)
+        except Exception as exc:
+            self.call_from_thread(status.update, f"[red]Export failed:[/red] {exc}")
+        finally:
+            self.is_exporting = False
+
+    def _on_export_success(self, result: ExportResult, out_dir: Path) -> None:
+        status = self.query_one("#status_message", Static)
+        status.update(f"[bold green]Export complete:[/bold green] {result.output_path.name} ({result.file_size_mb:.2f} MB)")
+        self.push_screen(SummaryModal(result, out_dir))
+
+    def cancel_export(self) -> None:
+        if self.is_exporting and self.cancel_token:
+            self.cancel_token.set()
+            self.query_one("#status_message", Static).update("[yellow]Cancelling export...[/yellow]")
