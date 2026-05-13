@@ -348,3 +348,203 @@ class AnimForgeApp(App):
                 Label("⚙️ Preset & Export Controls", classes="panel_title"),
                 ScrollableContainer(
                     Horizontal(
+                        Label("Preset:", classes="control_label"),
+                        Select(
+                            [
+                                ("ArtStation Breakdown (1.0s/step)", "artstation"),
+                                ("Detailed Study (1.8s/step)", "breakdown-slow"),
+                                ("Brisk Breakdown (0.5s/step)", "breakdown-fast"),
+                                ("3D Turntable (12 FPS)", "turntable"),
+                                ("Portfolio 4K WebP", "portfolio-4k"),
+                                ("Discord Breakdown (0.8s/step)", "discord"),
+                                ("Slack Breakdown (0.8s/step)", "slack"),
+                                ("Custom Settings", "custom"),
+                            ],
+                            value="artstation",
+                            id="preset_select",
+                            classes="control_input",
+                        ),
+                        classes="control_row",
+                    ),
+                    Horizontal(
+                        Label("Format:", classes="control_label"),
+                        Select(
+                            [("GIF Animation", "gif"), ("WebP Animation", "webp")],
+                            value="gif",
+                            id="format_select",
+                            classes="control_input",
+                        ),
+                        classes="control_row",
+                    ),
+                    Horizontal(
+                        Label("Target FPS:", classes="control_label"),
+                        Input(value="1.0", id="fps_input", classes="control_input"),
+                        classes="control_row",
+                    ),
+                    Horizontal(
+                        Label("Hold End (s):", classes="control_label"),
+                        Input(value="2.0", id="hold_input", classes="control_input"),
+                        classes="control_row",
+                    ),
+                    Horizontal(
+                        Label("Scale Preset:", classes="control_label"),
+                        Select(
+                            [
+                                ("Native 100%", "100%"),
+                                ("4K UHD (3840x2160)", "4k"),
+                                ("1080p FHD (1920x1080)", "1080p"),
+                                ("720p HD (1280x720)", "720p"),
+                                ("540p QHD (960x540)", "540p"),
+                            ],
+                            value="100%",
+                            id="scale_select",
+                            classes="control_input",
+                        ),
+                        classes="control_row",
+                    ),
+                    Horizontal(
+                        Label("Max Size (MB):", classes="control_label"),
+                        Input(value="10.0", id="budget_input", classes="control_input"),
+                        classes="control_row",
+                    ),
+                    Horizontal(
+                        Label("Colors / Qual:", classes="control_label"),
+                        Input(value="256", id="colors_input", classes="control_input"),
+                        classes="control_row",
+                    ),
+                    Horizontal(
+                        Label("Dithering:", classes="control_label"),
+                        Checkbox("Floyd-Steinberg Error Diffusion", value=True, id="dither_checkbox"),
+                        classes="control_row",
+                    ),
+                    Horizontal(
+                        Label("Harmonize:", classes="control_label"),
+                        Select(
+                            [
+                                ("Letterbox (Padded Canvas)", "letterbox"),
+                                ("Center Crop", "crop"),
+                                ("Stretch", "stretch"),
+                            ],
+                            value="letterbox",
+                            id="harmonize_select",
+                            classes="control_input",
+                        ),
+                        classes="control_row",
+                    ),
+                ),
+                id="right_column",
+            ),
+            id="main_layout",
+        )
+
+        # Bottom Progress & Actions Bar
+        yield Vertical(
+            ProgressBar(total=100, show_eta=False, id="progress_bar"),
+            Horizontal(
+                Static("Ready. Enter directory path or press Scan.", id="status_message"),
+                Container(
+                    Horizontal(
+                        Button("Export Animation", id="btn_export", variant="success"),
+                        Button("Cancel", id="btn_cancel", variant="error"),
+                    ),
+                    id="action_bar",
+                ),
+            ),
+            id="bottom_panel",
+        )
+
+        yield Footer()
+
+    def on_mount(self) -> None:
+        """Initialize table columns and trigger scan if initial path provided."""
+        table = self.query_one("#sequence_table", DataTable)
+        table.cursor_type = "row"
+        table.add_column("Camera / Pass", key="group_id")
+        table.add_column("Frames", key="frames")
+        table.add_column("Resolution", key="resolution")
+        table.add_column("Aspect", key="aspect")
+
+        if self.initial_path:
+            self.scan_path(self.initial_path)
+
+    # ------------------------------------------------------------------------
+    # User Interactions & Event Handlers
+    # ------------------------------------------------------------------------
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id
+        if button_id == "btn_scan":
+            path_val = self.query_one("#dir_input", Input).value.strip()
+            self.scan_path(path_val)
+        elif button_id == "btn_export":
+            self.start_export()
+        elif button_id == "btn_cancel":
+            self.cancel_export()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "dir_input":
+            self.scan_path(event.value.strip())
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "preset_select":
+            self._apply_preset(event.value)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        row_key = event.row_key.value
+        if row_key in self.current_groups:
+            self.active_group_id = row_key
+            self._update_details_view(self.current_groups[row_key])
+
+    def action_refresh_sequence(self) -> None:
+        path_val = self.query_one("#dir_input", Input).value.strip()
+        if path_val:
+            self.scan_path(path_val)
+
+    def action_trigger_export(self) -> None:
+        self.start_export()
+
+    # ------------------------------------------------------------------------
+    # Preset Synchronization
+    # ------------------------------------------------------------------------
+
+    def _apply_preset(self, preset_name: str) -> None:
+        try:
+            profile = get_preset_profile(preset_name)
+            self.query_one("#format_select", Select).value = profile.format.value
+            self.query_one("#fps_input", Input).value = str(profile.fps)
+            self.query_one("#hold_input", Input).value = str(profile.hold_last_seconds)
+            self.query_one("#budget_input", Input).value = str(profile.max_size_mb) if profile.max_size_mb else ""
+            if profile.format == ExportFormat.GIF:
+                self.query_one("#colors_input", Input).value = str(profile.color_count)
+            else:
+                self.query_one("#colors_input", Input).value = str(profile.quality)
+            self.query_one("#dither_checkbox", Checkbox).value = (profile.get_dither_mode() == DitherMode.FLOYD_STEINBERG)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------------
+    # Sequence Scanning & Inspection
+    # ------------------------------------------------------------------------
+
+    def scan_path(self, path_str: str) -> None:
+        status = self.query_one("#status_message", Static)
+        details = self.query_one("#sequence_details", Static)
+        table = self.query_one("#sequence_table", DataTable)
+
+        if not path_str:
+            status.update("[yellow]Please specify a sequence folder path.[/yellow]")
+            return
+
+        cleaned = clean_folder_path(path_str)
+        p = Path(cleaned)
+        if not p.exists() or not p.is_dir():
+            status.update(f"[red]Directory does not exist:[/red] {path_str}")
+            details.update("[red]Directory not found on disk.[/red]")
+            table.clear()
+            self.current_groups = {}
+            self.active_group_id = ""
+            return
+
+        try:
+            status.update(f"Scanning [cyan]{p.name}[/cyan]...")
+            paths = scan_directory(p)
