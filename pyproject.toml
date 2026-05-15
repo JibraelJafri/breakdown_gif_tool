@@ -4,14 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "animforge"
-version = "0.1.0"
-description = "Modern 3D render breakdown image sequence to animated GIF and WebP converter"
+version = "1.0.0"
+description = "Modern 3D render breakdown image sequence to animated GIF and WebP converter with zero external binaries"
 readme = "README.md"
 authors = [
-    { name = "Jibrael Jafri", email = "jibraeljafri@proton.me" }
+    { name = "AnimForge Team", email = "dev@animforge.internal" }
 ]
 license = { text = "MIT" }
 requires-python = ">=3.10"
+keywords = ["3d", "vfx", "artstation", "breakdown", "gif", "webp", "textual", "tui", "animation", "pillow"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Other Audience",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
 dependencies = [
     "Pillow>=10.0.0",
     "rich>=13.0.0",
@@ -23,3 +38,15 @@ dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
 ]
+
+[project.scripts]
+animforge = "breakdown_animator.app:main"
+breakdown-animator = "breakdown_animator.app:main"
+
+[project.urls]
+Homepage = "https://github.com/animforge/breakdown-animator"
+Documentation = "https://github.com/animforge/breakdown-animator#readme"
+Repository = "https://github.com/animforge/breakdown-animator.git"
+
+[tool.setuptools.packages.find]
+include = ["breakdown_animator*"]
